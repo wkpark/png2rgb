@@ -39,7 +39,12 @@
 #include <errno.h>
 #include <png.h>
 #include <setjmp.h>
+#ifndef WIN32
 #include <unistd.h>
+#else
+#define PATH_MAX 256
+#define R_OK 4
+#endif
 
 typedef struct convertbuf_struct convertbuf_t;
 
@@ -71,6 +76,19 @@ updateprogname(char *arg)
 	}	
 }
 
+typedef struct _bufferio
+{
+    unsigned char *buffer;
+    unsigned long offset;
+} bufferio_t;
+
+void image_read_bufdata(png_structp png_ptr, png_bytep data, png_size_t length)
+{
+    bufferio_t *srcio = (bufferio_t *)png_get_io_ptr(png_ptr);
+    memcpy(data, srcio->buffer + srcio->offset, length);
+    srcio->offset += length;
+}
+
 int
 png2rgb(convertbuf_t *cb, const char *filename, FILE *fout)
 {
@@ -82,12 +100,35 @@ png2rgb(convertbuf_t *cb, const char *filename, FILE *fout)
 	size_t rowbytes, passes, n;
 	FILE *fp;
 	png_byte header[8];
+#ifdef WIN32
+	// from https://www.andesengineering.com/svn/Chaskii/trunk/Chaskii/src/DB/Plugins/Png/ImageLoader_png.cpp
+	// XXX flynnt
+	// usage of straight stdio or istream with libpng on windows crashes.
+	// apparently that way is too standard and portable to work on windows.
+	// reverting to the ugly hack of reading the whole file in (at least that works)
+	// and then reading from the buffer.
+	//
+	// added by wkpark at gmail.com 2011/11/24
+	bufferio_t srcio;
+
+	long begin;
+	long end;
+	size_t filesize;
+	png_bytep buffer;
+#endif
 	
 	if(NULL == (fp = fopen(filename, "rb")))
 	{
 		perror(filename);
 		return -1;
 	}
+#ifdef WIN32
+	begin = ftell(fp);
+	fseek(fp, 0, SEEK_END);
+	end = ftell(fp);
+	fseek(fp, 0, SEEK_SET);
+	filesize = end - begin;
+#endif
 	fread(header, 1, sizeof(header), fp);
 	if(0 != png_sig_cmp(header, 0, sizeof(header)))
 	{
@@ -116,7 +157,18 @@ png2rgb(convertbuf_t *cb, const char *filename, FILE *fout)
 		return -1;
 	}
 #endif
+#ifdef WIN32
+	buffer = (png_bytep)malloc(filesize);
+	fread(buffer, filesize, 1, fp);
+	srcio.buffer = buffer;
+
+	srcio.offset = 0;
+
+	png_set_read_fn(png_ptr, &srcio, image_read_bufdata); 
+#else
+	// crash under Win32.
 	png_init_io(png_ptr, fp);
+#endif
 	png_set_sig_bytes(png_ptr, sizeof(header));
 	png_read_info(png_ptr, info_ptr);
 	png_get_IHDR(png_ptr, info_ptr, &width, &height, &depth, &coltype, NULL, NULL, NULL);
@@ -182,7 +234,7 @@ png2rgb(convertbuf_t *cb, const char *filename, FILE *fout)
 	}
 	for(y = 0; y < height; y++)
 	{
-		if(1 != fwrite(cb->rows[y], 1, rowbytes, fout))
+		if(!fwrite(cb->rows[y], 1, rowbytes, fout))
 		{
 			perror(filename);
 			png_destroy_read_struct(&png_ptr, &info_ptr, NULL);
